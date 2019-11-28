@@ -1,0 +1,217 @@
+#!/usr/bin/escript
+
+-include_lib("./include/erl_ofc.hrl").
+
+main(Args) ->
+  {ok, Forms} = epp_dodger:parse_file("include/erl_ofc.hrl"),
+  lists:map(fun(E) -> io:format("~p\n", [E]) end, Forms),
+  MacroMap = build_macro_map(Forms),
+  io:format("macro map: ~p\n", [MacroMap]),
+
+  FieldMap = build_field_map(Forms, MacroMap),
+  %io:format("field map: ~p\n", [FieldMap]),
+  Code = build_encoder(MacroMap, FieldMap),
+  file:write_file("src/erl_ofc_ejson.erl", list_to_binary(Code)),
+  ok.
+
+build_macro_map(SyntaxTree) ->
+  io:format("build_macro_map\n"),
+  MacroMap = #{},
+  lists:foldl(fun(T, Acc) ->
+                case erl_syntax:type(T) of
+                  attribute ->
+                    AttributeName = erl_syntax:attribute_name(T),
+                    case erl_syntax:type(AttributeName) of
+                      atom ->
+                        case erl_syntax:atom_value(AttributeName) of
+                          define ->
+                            handle_define(T, Acc);
+                          _ ->
+                            Acc
+                        end;
+                      _ -> Acc
+                    end;
+                  _ ->
+                    Acc
+                end
+              end, MacroMap, SyntaxTree).
+
+handle_define(T, Acc) ->
+  io:format("handle_define ~p\n", [T]),
+  AttributeArguments = erl_syntax:attribute_arguments(T),
+  VarT = lists:nth(1, AttributeArguments),
+  IntegerT = lists:nth(2, AttributeArguments),
+
+  VariableName = erl_syntax:variable_name(VarT),
+  Integer = erl_syntax:integer_value(IntegerT),
+
+  Acc#{VariableName => Integer}.
+
+build_field_map(SyntaxTree, MacroMap) ->
+  FieldMap = #{},
+  lists:foldl(fun(T, Acc) ->
+                case erl_syntax:type(T) of
+                  attribute ->
+                    handle_attribute(T, Acc, MacroMap);
+                  _ ->
+                    Acc
+                end
+              end, FieldMap, SyntaxTree).
+
+handle_attribute(T, Acc, MacroMap) ->
+  AttributeName = erl_syntax:attribute_name(T),
+  io:format("attribute_name: ~p\n", [AttributeName]),
+  case erl_syntax:type(AttributeName) of
+    atom ->
+      case erl_syntax:atom_value(AttributeName) of
+        record ->
+          handle_record(T, Acc, MacroMap);
+        _ ->
+          Acc
+      end;
+    _ -> Acc
+  end.
+
+handle_record(T, Acc, MacroMap) ->
+  [RecordNameT|FieldsTuple] = erl_syntax:attribute_arguments(T),
+  Name = get_record_name(RecordNameT),
+  RecordFields = erl_syntax:tuple_elements(lists:nth(1, FieldsTuple)),
+  FieldsR = lists:foldl(fun(FieldT, Acc) ->
+                            io:format("field: ~p\n", [FieldT]),
+                            FieldName = get_record_field_name(FieldT),
+                            FieldVal = get_record_field_value(FieldT, MacroMap),
+                            [{FieldName, FieldVal}|Acc]
+                       end, [], RecordFields),
+  Fields = lists:reverse(FieldsR),
+  Acc#{Name => Fields}.
+
+get_record_name(T) ->
+  case erl_syntax:type(T) of
+    atom -> erl_syntax:atom_value(T)
+  end.
+
+
+get_record_field_name(T) ->
+  NameT = case erl_syntax:type(T) of
+            typed_record_field ->
+              Body = erl_syntax:typed_record_field_body(T),
+              erl_syntax:record_field_name(Body);
+            record_field ->
+              erl_syntax:record_field_name(T)
+          end,
+  erl_syntax:atom_value(NameT).
+
+get_record_field_value(T, MacroMap) ->
+  ValT = case erl_syntax:type(T) of
+    typed_record_field ->
+      Body = erl_syntax:typed_record_field_body(T),
+      erl_syntax:record_field_value(Body);
+    record_field ->
+      erl_syntax:record_field_value(T)
+  end,
+  case ValT of
+    none -> none;
+    _ ->
+      case erl_syntax:type(ValT) of
+        integer ->
+          erl_syntax:integer_value(ValT);
+        macro ->
+          MacroNameT = erl_syntax:macro_name(ValT),
+          MacroName = erl_syntax:atom_value(MacroNameT),
+          #{MacroName := MacroValue} = MacroMap,
+          io:format("macro ~p value: ~p\n", [MacroName, MacroValue]),
+          MacroValue;
+        nil -> [];
+        record_expr -> none
+      end
+  end.
+
+to_map(Record, Fields) ->
+  {_, Map} = lists:foldl(fun({Field, _}, {Index, Map}) ->
+                             Val = element(Index, Record),
+                             NewMap = Map#{list_to_binary(atom_to_list(Field)) => encode(Val)},
+                             {Index+1, NewMap}
+                         end, {2, #{}}, Fields),
+  Map#{<<"_type_">> => list_to_binary(atom_to_list(element(1, Record)))}.
+
+encode(List) when is_list(List) ->
+  lists:map(fun encode/1, List);
+
+encode(Bin) when is_binary(Bin) ->
+  base64:encode(Bin);
+
+encode(Val) -> Val.
+
+to_record(Map, Fields) ->
+  #{<<"_type_">> := RecordName} = Map,
+  List = lists:foldl(fun({Field, Default}, Acc) ->
+                         FieldBin = list_to_binary(atom_to_list(Field)),
+                         Val = maps:get(FieldBin, Map, Default),
+                         [decode(Val)|Acc]
+                     end, [list_to_atom(binary_to_list(RecordName))], Fields),
+  list_to_tuple(lists:reverse(List)).
+
+decode(List) when is_list(List) ->
+  lists:map(fun decode/1, List);
+
+decode(Bin) when is_binary(Bin) ->
+  base64:decode(Bin);
+
+decode(Val) ->
+  Val.
+
+build_encoder(MacroMap, FieldMap) ->
+  Base = "% This file is generated using 'code_gen'. Do not edit!
+
+-module(erl_ofc_ejson).
+-include(\"erl_ofc.hrl\").
+
+-export([encode/1,decode/1]).
+
+
+to_map(Record, Fields) ->
+  {_, Map} = lists:foldl(fun({Field, _}, {Index, Map}) ->
+                             Val = element(Index, Record),
+                             NewMap = Map#{list_to_binary(atom_to_list(Field)) => encode(Val)},
+                             {Index+1, NewMap}
+                         end, {2, #{}}, Fields),
+  Map#{<<\"_type_\">> => list_to_binary(atom_to_list(element(1, Record)))}.
+
+
+~s
+
+encode(List) when is_list(List) ->
+  lists:map(fun encode/1, List);
+
+encode(Bin) when is_binary(Bin) ->
+  base64:encode(Bin);
+
+encode(Val) -> Val.
+
+to_record(Map, Fields) ->
+  #{<<\"_type_\">> := RecordName} = Map,
+  List = lists:foldl(fun({Field, Default}, Acc) ->
+                         FieldBin = list_to_binary(atom_to_list(Field)),
+                         Val = maps:get(FieldBin, Map, Default),
+                         [decode(Val)|Acc]
+                     end, [list_to_atom(binary_to_list(RecordName))], Fields),
+  list_to_tuple(lists:reverse(List)).
+
+~s
+
+decode(List) when is_list(List) ->
+  lists:map(fun decode/1, List);
+
+decode(Bin) when is_binary(Bin) ->
+  base64:decode(Bin);
+
+decode(Val) -> Val.
+",
+  Encoder = maps:fold(fun(K, V, Acc) ->
+                string:concat(Acc, lists:flatten(io_lib:format("encode(Record) when is_record(Record, ~s) -> to_map(Record, ~p);\n", [K, V])))
+            end, "", FieldMap),
+  Decoder = maps:fold(fun(K, V, Acc) ->
+                string:concat(Acc, lists:flatten(io_lib:format("decode(#{<<\"_type_\">> := <<\"~s\">>} = Map) -> to_record(Map, ~p);\n", [K, V])))
+            end, "", FieldMap),
+  lists:flatten(io_lib:format(Base, [Encoder, Decoder])).
+

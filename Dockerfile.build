@@ -1,0 +1,8 @@
+FROM erlang:20
+
+ADD . /tmp/build/erl_ofc
+ENV ERL_LIBS /tmp/build/
+WORKDIR /tmp/build/erl_ofc
+RUN escript code_gen
+RUN make
+

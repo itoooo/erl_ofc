@@ -1,0 +1,13 @@
+{application, erl_ofc,
+ [
+  {description, "The OpenFlow protocol library for Erlang"},
+  {vsn, "VERSION"},
+  {registered, []},
+  {applications, [
+                  kernel,
+                  stdlib
+                 ]},
+  {mod, {erl_ofc_app, []}},
+  {modules, []},
+  {env, []}
+ ]}.
